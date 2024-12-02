@@ -35,7 +35,8 @@ import time
 
 import torch.multiprocessing as mp
 from torch.multiprocessing import Queue, Process
-from src.pipelines.context_worker import context_worker
+from src.pipelines.context_worker import context_worker, context_worker_c0, context_worker_c2, vae_worker
+# from src.pipelines.context_worker_velo import context_worker, context_worker_c0, velocity_worker_c0, velocity_worker
 mp.set_start_method('spawn', force=True)
 
 ffmpeg_path = os.getenv('FFMPEG_PATH')
@@ -109,12 +110,8 @@ def get_device_map(num_gpus):
 
 def main():
     args = parse_args()
-
-
-
     ####################Check GPU ##########################
     device_map = get_device_map(torch.cuda.device_count())
-    print("DEVICE MAP: ", str(device_map))
     #######################################################
 
     config = OmegaConf.load(args.config)
@@ -129,17 +126,12 @@ def main():
 
     inference_config_path = config.inference_config
     infer_config = OmegaConf.load(inference_config_path)
-
-
     ############# model_init started #############
 
     ## vae init
     vae = AutoencoderKL.from_pretrained(
         config.pretrained_vae_path,
     ).to("cuda", dtype=weight_dtype)
-
-
-    print("main config:" , str(config))
 
     ## reference net init
     reference_unet = UNet2DConditionModel.from_pretrained(
@@ -153,8 +145,6 @@ def main():
     ## denoising net init
     if os.path.exists(config.motion_module_path):
         ### stage1 + stage2
-        print("original path exist")
-        print("weight dtype original:", weight_dtype)
         denoising_unet = EchoUNet3DConditionModel.from_pretrained_2d(
             config.pretrained_base_model_path,
             config.motion_module_path,
@@ -206,25 +196,65 @@ def main():
     )
 
 
-    
-    # ADD process start
-    for _ in range(pipe.num_processes):
-        p = Process(
-            target=context_worker,
-            args=(
-                pipe.input_queue,
-                pipe.output_queue,
-                sched_kwargs,  # Pass config instead of scheduler
-                config,
-                infer_config
+    devices = ["cuda:0", "cuda:1",  "cuda:2"]  # Duplicate cuda:1 and cuda:2
+    for i in range(len(devices)):  # Changed to iterate over devices
+       p = Process(
+           target=vae_worker,
+           args=(config, weight_dtype, pipe.input_queue_to_vae_worker, pipe.output_queue_from_vae_worker, devices[i])
+       )
+       p.start()
+       pipe.processes.append(p)
+            
+
+    num_inference_steps = args.steps
+    for i in range(pipe.num_processes):
+        if i == 0:
+            p = Process(
+                target=context_worker_c0,
+                args=(
+                    pipe.input_queue,
+                    pipe.output_queue,
+                    sched_kwargs,  # Pass config instead of scheduler
+                    config,
+                    infer_config,
+                    num_inference_steps,
+                )
             )
-        )
-        p.start()
-        pipe.processes.append(p)
+            p.start()
+            pipe.processes.append(p)
+        elif i ==1:
+            p = Process(
+                target=context_worker,
+                args=(
+                    pipe.input_queue,
+                    pipe.output_queue,
+                    sched_kwargs,  # Pass config instead of scheduler
+                    config,
+                    infer_config,
+                    num_inference_steps
+                )
+            )
+            p.start()
+            pipe.processes.append(p)
+        else:
+            p = Process(
+                target=context_worker_c2,
+                args=(
+                    pipe.input_queue,
+                    pipe.output_queue,
+                    sched_kwargs,  # Pass config instead of scheduler
+                    config,
+                    infer_config,
+                    num_inference_steps
+                )
+            )
+            p.start()
+            pipe.processes.append(p)
+            
+    print("############ WAIT FOR PROCESS TO LOAD#############")
+    time.sleep(90)
+    print("############ SLEEP END #############")
 
-
-
-    
     pipe = pipe.to("cuda", dtype=weight_dtype)
 
     date_str = datetime.now().strftime("%Y%m%d")
@@ -309,14 +339,22 @@ def main():
             video_clip.write_videofile(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4", codec="libx264", audio_codec="aac")
             print(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4")
     
-    
-    # Cleanup processes
-    for _ in range(pipe.num_processes):
-        pipe.input_queue.put(None)  # Send stop signal to each worker
+    # Send stop signals to VAE workers
+    for _ in range(3):  # Number of VAE workers (cuda:1, cuda:2)
+        pipe.input_queue_to_vae_worker.put(None)
 
+    # Send stop signals to context workers 
+    for _ in range(3):  # Number of context workers (c0, c1, c2)
+        pipe.input_queue.put(None)
+
+    # Wait with timeout
     for p in pipe.processes:
-        p.join()  # Wait for processes to finish
-        print("-------------- CLOSE OUT PROCESS --------------")
+       p.join(timeout=7)  # Set timeout to detect stuck processes
+       if p.is_alive():
+           print(f"Process {p.pid} failed to terminate")
+           p.terminate()  # Force terminate if stuck
+       print("------------------------Closed process:", p.pid, "----------------------")
+
 
 
 if __name__ == "__main__":
